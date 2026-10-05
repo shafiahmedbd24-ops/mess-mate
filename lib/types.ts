@@ -1,0 +1,9 @@
+export type Role='member'|'manager'|'admin'|'super_admin';
+export type Member={id:string;name:string;email:string;role:Role;joinedAt:string};
+export type Meal={id:string;memberId:string;date:string;breakfast:number;lunch:number;dinner:number};
+export type Expense={id:string;date:string;title:string;amount:number;category:'food'|'gas'|'salary'|'other';createdBy:string};
+export type Deposit={id:string;memberId:string;date:string;amount:number;note:string};
+export type Ledger={members:Member[];meals:Meal[];expenses:Expense[];deposits:Deposit[]};
+export type Statement={memberId:string;meals:number;foodCost:number;sharedCost:number;totalCost:number;deposits:number;balance:number};
+export type Summary={totalMeals:number;foodExpenses:number;sharedExpenses:number;totalExpenses:number;totalDeposits:number;fund:number;mealRate:number;unallocatedFood:number;statements:Statement[]};
+export type ViewData=Ledger & {user:Member;summary:Summary};
