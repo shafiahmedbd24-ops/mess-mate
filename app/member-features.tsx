@@ -5,7 +5,7 @@ import type {Member,MealRequest} from '@/lib/types';
 const active=(m:Member)=>m.role==='super_admin'||!m.status||m.status==='active';
 const today=()=>new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Dhaka'});
 const labels={pending:'অনুমোদনের অপেক্ষায়',active:'মেসে যুক্ত',excluded:'মেসের বাইরে',deleted:'সরানো হয়েছে'};
-type Mutate=(action:string,payload:any)=>Promise<void>;
+type Mutate=(action:string,payload:any)=>Promise<unknown>;
 export function ProfilePanel({user,busy,mutate}:{user:Member;busy:boolean;mutate:Mutate}){return <section className="panel feature-panel"><div className="feature-heading"><UserRound/><div><h3>আমার প্রোফাইল</h3><p>আপনার পরিচিতি ও সদস্যপদ</p></div></div><p className="profile-email">{user.email}</p><span className={'membership-badge '+(active(user)?'active':'pending')}>{labels[user.status||'active']}</span><form key={user.name} className="feature-form" onSubmit={e=>{e.preventDefault();void mutate('profile',{name:new FormData(e.currentTarget).get('name')});}}><label>আপনার নাম<input name="name" required maxLength={80} defaultValue={user.name}/></label><button className="primary" disabled={busy}><Pencil size={16}/>নাম সংরক্ষণ করুন</button></form></section>;}
 export function MembersPanel({members,user,busy,mutate}:{members:Member[];user:Member;busy:boolean;mutate:Mutate}){
  const [edit,setEdit]=useState<Member|null>(null),[confirmation,setConfirmation]=useState<{member:Member;status:string}|null>(null),[showRemoved,setShowRemoved]=useState(false);
