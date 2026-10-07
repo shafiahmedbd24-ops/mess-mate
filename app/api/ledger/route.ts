@@ -8,23 +8,35 @@ async function identity(req:NextRequest){
  const token=req.headers.get('authorization')?.replace(/^Bearer /,'');if(!token)throw new Error('UNAUTHORIZED');
  const decoded=await adminAuth().verifyIdToken(token,true);if(!decoded.email_verified)throw new Error('VERIFY_EMAIL');
  const ref=db().collection('members').doc(decoded.uid);
+ const snapshot=await ref.get();const current=snapshot.data() as Member|undefined;if(current)return {...current,id:decoded.uid,role:decoded.uid===process.env.SUPER_ADMIN_UID?'super_admin':current.role} as Member;
  const user=await db().runTransaction(async tx=>{const snap=await tx.get(ref);const existing=snap.data() as Member|undefined;
  if(existing)return {...existing,id:decoded.uid,role:decoded.uid===process.env.SUPER_ADMIN_UID?'super_admin':existing.role} as Member;
  const record:Member={id:decoded.uid,name:decoded.name||decoded.email?.split('@')[0]||'Member',email:decoded.email||'',role:decoded.uid===process.env.SUPER_ADMIN_UID?'super_admin':'member',status:decoded.uid===process.env.SUPER_ADMIN_UID?'active':'pending',periods:decoded.uid===process.env.SUPER_ADMIN_UID?[{start:new Date().toISOString()}]:[],joinedAt:new Date().toISOString()};tx.set(ref,record);return record;});return user;
 }
 function failure(e:unknown){const message=e instanceof Error?e.message:'SERVER_ERROR';const known=['UNAUTHORIZED','VERIFY_EMAIL','FORBIDDEN','INVALID_INPUT','MEMBER_NOT_FOUND','MEMBER_NOT_ELIGIBLE','ENTRY_NOT_FOUND','MEAL_CONFLICT','MEMBERSHIP_REQUIRED','REQUEST_CLOSED','MEAL_CHANGED','MEAL_SHEET_CHANGED'];return NextResponse.json({error:message==='MEAL_SHEET_CHANGED'?'এই দিনের মিল অন্য কেউ পরিবর্তন করেছেন। সর্বশেষ মিল লোড করে আবার সংশোধন করুন।':message==='MEMBERSHIP_REQUIRED'?'এই সদস্য বর্তমানে মেসে যুক্ত নেই।':message==='REQUEST_CLOSED'?'রিকোয়েস্টটি ইতিমধ্যে নিষ্পত্তি হয়েছে।':message==='MEAL_CHANGED'?'রিকোয়েস্ট পাঠানোর পর এই দিনের মিল পরিবর্তন হয়েছে। রিকোয়েস্ট প্রত্যাখ্যান করে নতুন রিকোয়েস্ট নিন।':message==='ENTRY_NOT_FOUND'?'এন্ট্রিটি আর পাওয়া যাচ্ছে না। পেজ রিফ্রেশ করুন।':message==='MEAL_CONFLICT'?'এই সদস্য ও তারিখের মিল আগে থেকেই আছে। সেই এন্ট্রিটি এডিট করুন।':message==='MEMBER_NOT_ELIGIBLE'?'সদস্য যে মাসে যুক্ত হয়েছেন, তার আগের মাসে মিল বা জমা দেওয়া যাবে না।':message==='MEMBER_NOT_FOUND'?'নির্বাচিত সদস্যকে পাওয়া যায়নি। পেজ রিফ্রেশ করে আবার সদস্য নির্বাচন করুন।':known.includes(message)?message:'সার্ভারের সংযোগ ব্যর্থ হয়েছে। Firebase configuration পরীক্ষা করুন।'},{status:message==='UNAUTHORIZED'?401:message==='FORBIDDEN'||message==='VERIFY_EMAIL'?403:known.includes(message)?400:500});}
-export async function GET(req:NextRequest){try{const user=await identity(req),month=req.nextUrl.searchParams.get('month')||new Date().toISOString().slice(0,7);if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))throw new Error('INVALID_INPUT');
- const names=['members','meals','expenses','deposits'] as const;const snapshots=await Promise.all(names.map(n=>db().collection(n).get()));
- const data=Object.fromEntries(names.map((n,i)=>[n,snapshots[i].docs.map(d=>({...d.data(),id:d.id}))])) as Ledger;
- const requestQuery=user.role==='member'||!isActive(user)?db().collection('mealRequests').where('memberId','==',user.id):db().collection('mealRequests');const requestSnap=await requestQuery.get();data.requests=requestSnap.docs.map(d=>({...d.data(),id:d.id})) as Ledger['requests'];
- if(!isActive(user))return NextResponse.json({user,members:[user],meals:[],expenses:[],deposits:[],requests:[],summary:calculate({members:[],meals:[],expenses:[],deposits:[]},month)});
- const summary=calculate(data,month);if(user.role==='member')return NextResponse.json({user,members:[user],requests:data.requests,meals:data.meals.filter(x=>x.memberId===user.id&&x.date.startsWith(month)),expenses:[],deposits:data.deposits.filter(x=>x.memberId===user.id&&x.date.startsWith(month)),summary:{mealRate:summary.mealRate,statements:summary.statements.filter((x:{memberId:string})=>x.memberId===user.id)}});
- return NextResponse.json({...data,user,summary});}catch(e){return failure(e);}}
+export async function GET(req:NextRequest){const started=Date.now();try{
+ const user=await identity(req),month=req.nextUrl.searchParams.get('month')||new Date().toISOString().slice(0,7);
+ if(!/^\d{4}-(0[1-9]|1[0-2])$/.test(month))throw new Error('INVALID_INPUT');
+ const respond=(body:unknown)=>NextResponse.json(body,{headers:{'Cache-Control':'private, no-store','Server-Timing':'ledger;dur='+(Date.now()-started)}});
+ if(!isActive(user))return respond({user,members:[user],meals:[],expenses:[],deposits:[],requests:[],summary:calculate({members:[],meals:[],expenses:[],deposits:[]},month)});
+ const database=db(),start=month+'-01',next=new Date(Date.UTC(Number(month.slice(0,4)),Number(month.slice(5,7)),1)).toISOString().slice(0,10);
+ const monthly=(name:string)=>database.collection(name).where('date','>=',start).where('date','<',next).get();
+ const requestSource=database.collection('mealRequests');
+ // Single-field queries keep old pending requests and upcoming plans without a composite index.
+ const earliest=start<localDate()?start:localDate();const future=new Date(Date.now()+367*86400000).toISOString().slice(0,10);const latest=next>future?next:future;
+ const queries=user.role==='member'?[requestSource.where('memberId','==',user.id).get()]:[requestSource.where('date','>=',earliest).where('date','<',latest).get(),requestSource.where('status','==','pending').get()];
+ const [members,meals,expenses,deposits,...requests]=await Promise.all([database.collection('members').get(),monthly('meals'),monthly('expenses'),monthly('deposits'),...queries]);
+ const docs=(snapshot:any)=>snapshot.docs.map((d:any)=>({...d.data(),id:d.id}));
+ const data={members:docs(members),meals:docs(meals),expenses:docs(expenses),deposits:docs(deposits),requests:[...new Map(requests.flatMap(docs).map((r:any)=>[r.id,r])).values()]} as Ledger;
+ const summary=calculate(data,month);
+ if(user.role==='member')return respond({user,members:[user],requests:data.requests,meals:data.meals.filter(x=>x.memberId===user.id),expenses:[],deposits:data.deposits.filter(x=>x.memberId===user.id),summary:{mealRate:summary.mealRate,statements:summary.statements.filter((x:{memberId:string})=>x.memberId===user.id)}});
+ return respond({...data,user,summary});
+ }catch(e){return failure(e);}}
 export async function POST(req:NextRequest){try{const user=await identity(req);const {action,payload}=await req.json();const p=payload||{};
  const managed=await memberAction(user,action,p);if(managed)return managed;
  if(!isActive(user))throw new Error('MEMBERSHIP_REQUIRED');if(user.role==='member')throw new Error('FORBIDDEN');
  if(action==='mealsBulk')return await saveDailyMeals(user,p);
- if(action==='role'){if(user.role!=='super_admin')throw new Error('FORBIDDEN');if(!roles.includes(p.role)||p.memberId===process.env.SUPER_ADMIN_UID)throw new Error('INVALID_INPUT');const ref=db().collection('members').doc(p.memberId);const target=await ref.get();if(!target.exists)throw new Error('MEMBER_NOT_FOUND');if(!isActive(target.data() as Member))throw new Error('MEMBERSHIP_REQUIRED');const batch=db().batch();batch.update(ref,{role:p.role});batch.set(db().collection('audit').doc(),{action,actor:user.id,target:p.memberId,role:p.role,at:new Date().toISOString()});await batch.commit();return NextResponse.json({ok:true});}
+ if(action==='role'){if(user.role!=='super_admin')throw new Error('FORBIDDEN');if(!roles.includes(p.role)||p.memberId===process.env.SUPER_ADMIN_UID)throw new Error('INVALID_INPUT');const ref=db().collection('members').doc(p.memberId);const target=await ref.get();if(!target.exists)throw new Error('MEMBER_NOT_FOUND');if(!isActive(target.data() as Member))throw new Error('MEMBERSHIP_REQUIRED');const batch=db().batch();batch.update(ref,{role:p.role});batch.set(db().collection('audit').doc(),{action,actor:user.id,target:p.memberId,role:p.role,at:new Date().toISOString()});await batch.commit();return NextResponse.json({ok:true,patch:{members:[{...target.data(),id:p.memberId,role:p.role}]}});}
  if(action==='delete'){
   const collections={meal:'meals',expense:'expenses',deposit:'deposits'};
   if(!Object.hasOwn(collections,p.kind)||typeof p.id!=='string'||!p.id||p.id.includes('/'))throw new Error('INVALID_INPUT');
@@ -33,7 +45,7 @@ export async function POST(req:NextRequest){try{const user=await identity(req);c
    const before=existing.data()!;const at=new Date().toISOString();
    tx.set(db().collection('deletedEntries').doc(),{collection,originalId:ref.id,record:before,deletedBy:user.id,deletedAt:at});
    tx.delete(ref);tx.set(db().collection('audit').doc(),{action:'delete',actor:user.id,target:ref.path,at,before});
-  });return NextResponse.json({ok:true});
+  });return NextResponse.json({ok:true,patch:{removed:{[collection]:[p.id]}}});
  }
  if(!['meal','expense','deposit'].includes(action))throw new Error('INVALID_INPUT');
  if(p.id!==undefined&&(typeof p.id!=='string'||!p.id||p.id.includes('/')))throw new Error('INVALID_INPUT');
@@ -53,7 +65,7 @@ export async function POST(req:NextRequest){try{const user=await identity(req);c
   if(action==='expense'&&before)record.createdBy=before.createdBy;
   if(oldRef.path!==ref.path)tx.delete(oldRef);
   tx.set(ref,record);tx.set(db().collection('audit').doc(),{action:before?'edit':'create',kind:action,actor:user.id,target:ref.path,previousTarget:oldRef.path,at:new Date().toISOString(),before,record});
- });return NextResponse.json({ok:true});}catch(e){return failure(e);}}
+ });return NextResponse.json({ok:true,patch:{[collection]:[{...record,id:ref.id}],removed:{[collection]:p.id&&p.id!==ref.id?[p.id]:[]}}});}catch(e){return failure(e);}}
 
 
 function isActive(m:Member){return m.role==='super_admin'||!m.status||m.status==='active';}
@@ -72,7 +84,7 @@ async function memberAction(user:Member,action:string,p:any){
   if(action==='memberUpdate'&&(p.status!==undefined&&!['active','excluded','deleted'].includes(p.status)))throw new Error('INVALID_INPUT');
   if(p.name===undefined&&p.status===undefined)throw new Error('INVALID_INPUT');
   const ref=database.collection('members').doc(id);
-  await database.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw new Error('MEMBER_NOT_FOUND');const before=snap.data() as Member;
+  const updated=await database.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw new Error('MEMBER_NOT_FOUND');const before=snap.data() as Member;
    if(action==='memberUpdate'&&(id===user.id||id===process.env.SUPER_ADMIN_UID||before.role==='super_admin'))throw new Error('FORBIDDEN');
    if(action==='memberUpdate'&&user.role!=='super_admin'&&before.role!=='member')throw new Error('FORBIDDEN');
    const next={...before,...(p.name!==undefined?{name:p.name.trim()}:{})};
@@ -82,34 +94,35 @@ async function memberAction(user:Member,action:string,p:any){
     if(p.status!=='active')for(const period of periods)if(!period.end)period.end=at;
     next.periods=periods;next.status=p.status;if(p.status!=='active')next.role='member';
    }
-   tx.set(ref,next);audit(tx,ref.path,before,next);
-  });return NextResponse.json({ok:true});
+   tx.set(ref,next);audit(tx,ref.path,before,next);return {...next,id};
+  });return NextResponse.json({ok:true,patch:{members:[updated],...(id===user.id?{user:{...updated,role:user.role}}:{})}});
  }
  if(!isActive(user))throw new Error('MEMBERSHIP_REQUIRED');
  if(action==='requestMeal'){
   if(!validDate(p.date)||p.date<localDate()||p.date>new Date(Date.now()+366*86400000).toISOString().slice(0,10)||!mealValues(p))throw new Error('INVALID_INPUT');
   const ref=database.collection('mealRequests').doc(user.id+'_'+p.date),mealRef=database.collection('meals').doc(user.id+'_'+p.date);
-  await database.runTransaction(async tx=>{const old=await tx.get(ref),meal=await tx.get(mealRef);const before=old.data();
+  const updated=await database.runTransaction(async tx=>{const old=await tx.get(ref),meal=await tx.get(mealRef);const before=old.data();
    if(before?.status==='approved')throw new Error('REQUEST_CLOSED');
    const record={memberId:user.id,date:p.date,breakfast:p.breakfast,lunch:p.lunch,dinner:p.dinner,status:'pending',createdAt:at,baseline:fingerprint(meal.data())};
-   tx.set(ref,record);audit(tx,ref.path,before||null,record);
-  });return NextResponse.json({ok:true});
+   tx.set(ref,record);audit(tx,ref.path,before||null,record);return {...record,id:ref.id};
+  });return NextResponse.json({ok:true,patch:{requests:[updated]}});
  }
  if(typeof p.id!=='string'||!p.id||p.id.includes('/'))throw new Error('INVALID_INPUT');const ref=database.collection('mealRequests').doc(p.id);
- await database.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw new Error('ENTRY_NOT_FOUND');const request=snap.data()!;if(request.status!=='pending')throw new Error('REQUEST_CLOSED');
-  if(action==='cancelRequest'){if(request.memberId!==user.id)throw new Error('FORBIDDEN');const next={...request,status:'cancelled',reviewedAt:at};tx.set(ref,next);audit(tx,ref.path,request,next);return;}
+ const patch=await database.runTransaction(async tx=>{const snap=await tx.get(ref);if(!snap.exists)throw new Error('ENTRY_NOT_FOUND');const request=snap.data()!;if(request.status!=='pending')throw new Error('REQUEST_CLOSED');
+  if(action==='cancelRequest'){if(request.memberId!==user.id)throw new Error('FORBIDDEN');const next={...request,status:'cancelled',reviewedAt:at};tx.set(ref,next);audit(tx,ref.path,request,next);return {requests:[{...next,id:ref.id}]};}
   if(user.role==='member')throw new Error('FORBIDDEN');if(!['approved','rejected'].includes(p.status))throw new Error('INVALID_INPUT');
   const memberRef=database.collection('members').doc(request.memberId),mealRef=database.collection('meals').doc(request.memberId+'_'+request.date);
   const member=await tx.get(memberRef),meal=await tx.get(mealRef);
+  const changedMeals:Record<string,unknown>[]=[];
   if(p.status==='approved'){
    if(!member.exists||!isActive(member.data() as Member))throw new Error('MEMBERSHIP_REQUIRED');
    if(request.date<localDate())throw new Error('INVALID_INPUT');
    if(fingerprint(meal.data())!==request.baseline)throw new Error('MEAL_CHANGED');
    const record={memberId:request.memberId,date:request.date,breakfast:request.breakfast,lunch:request.lunch,dinner:request.dinner};
-   tx.set(mealRef,record);audit(tx,mealRef.path,meal.data()||null,record);
+   tx.set(mealRef,record);audit(tx,mealRef.path,meal.data()||null,record);changedMeals.push({...record,id:mealRef.id});
   }
-  const next={...request,status:p.status,reviewedAt:at,reviewedBy:user.id};tx.set(ref,next);audit(tx,ref.path,request,next);
- });return NextResponse.json({ok:true});
+  const next={...request,status:p.status,reviewedAt:at,reviewedBy:user.id};tx.set(ref,next);audit(tx,ref.path,request,next);return {requests:[{...next,id:ref.id}],meals:changedMeals};
+ });return NextResponse.json({ok:true,patch});
 }
 
 function accountingEligible(m:Member,month:string){return m.periods?m.periods.some(p=>p.start.slice(0,7)<=month&&(!p.end||p.end.slice(0,7)>=month)):eligibleForMonth(m.joinedAt,month);}
@@ -119,7 +132,7 @@ async function saveDailyMeals(user:Member,p:any){
  const ids=new Set<string>();
  for(const entry of p.entries){if(!entry||typeof entry.memberId!=='string'||!entry.memberId||entry.memberId.includes('/')||ids.has(entry.memberId)||!mealValues(entry)||typeof entry.baseline!=='string')throw new Error('INVALID_INPUT');ids.add(entry.memberId);}
  const database=db(),at=new Date().toISOString();
- await database.runTransaction(async tx=>{
+ const updated=await database.runTransaction(async tx=>{
   const actor=await tx.get(database.collection('members').doc(user.id));
   if(!actor.exists||!isActive(actor.data() as Member)||(user.id!==process.env.SUPER_ADMIN_UID&&(actor.data() as Member).role==='member'))throw new Error('FORBIDDEN');
   // Read every target before writing so failure cannot leave a partially saved day.
@@ -132,5 +145,6 @@ async function saveDailyMeals(user:Member,p:any){
   for(const {entry,ref,meal} of targets){const record={memberId:entry.memberId,date:p.date,breakfast:entry.breakfast,lunch:entry.lunch,dinner:entry.dinner};
    tx.set(ref,record);tx.set(database.collection('audit').doc(),{action:meal.exists?'edit':'create',kind:'meal',source:'daily-sheet',actor:user.id,target:ref.path,at,before:meal.data()||null,record});
   }
- });return NextResponse.json({ok:true,saved:p.entries.length});
+  return targets.map(({entry,ref}:any)=>({id:ref.id,memberId:entry.memberId,date:p.date,breakfast:entry.breakfast,lunch:entry.lunch,dinner:entry.dinner}));
+ });return NextResponse.json({ok:true,saved:p.entries.length,patch:{meals:updated}});
 }
